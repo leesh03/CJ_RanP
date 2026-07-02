@@ -110,6 +110,14 @@ class Palletizer:
         self.terminated_step: Optional[int] = None
         self.finished_by_user = False
 
+        # 핀휠(둘레 회전) 1단계 상태. 바닥층(z=0)에서만 동작하며, 4변이
+        # 모두 막히면 영구히 비활성화되고 이후는 extreme-point 로직만 사용한다.
+        # edge 0=bottom(+x), 1=right(+y), 2=top(-x), 3=left(-y)
+        self._pinwheel_active = True
+        self._pinwheel_closed = [False, False, False, False]
+        self._pinwheel_ptr = 0
+        self._pinwheel_cursor = [0.0, 0.0, self.pallet.length, self.pallet.width]
+
     # -----------------------------------------------------------------------
     # 참가자 수정 가능 함수
     # -----------------------------------------------------------------------
@@ -223,6 +231,101 @@ class Palletizer:
         return best
 
     # -----------------------------------------------------------------------
+    # 핀휠(둘레 회전) 배치 — 바닥층 한정
+    # -----------------------------------------------------------------------
+
+    def _pinwheel_edge_candidate(
+        self, edge: int, dx: float, dy: float
+    ) -> Optional[Tuple[float, float, float]]:
+        """edge 벽에 (dx, dy) footprint를 붙여놓을 (x, y, 소비 길이)를 계산한다.
+        팔레트 경계를 벗어나면 None."""
+        length, width = self.pallet.length, self.pallet.width
+        cursor = self._pinwheel_cursor[edge]
+
+        if edge == 0:  # bottom, y=0 벽, x 증가 방향
+            x, y = cursor, 0.0
+            if x + dx > length + _EPS:
+                return None
+            return x, y, dx
+        if edge == 1:  # right, x=length 벽, y 증가 방향
+            x, y = length - dx, cursor
+            if x < -_EPS or y + dy > width + _EPS:
+                return None
+            return x, y, dy
+        if edge == 2:  # top, y=width 벽, x 감소 방향
+            x, y = cursor - dx, width - dy
+            if x < -_EPS or y < -_EPS:
+                return None
+            return x, y, dx
+        # edge == 3, left, x=0 벽, y 감소 방향
+        x, y = 0.0, cursor - dy
+        if y < -_EPS:
+            return None
+        return x, y, dy
+
+    def _pinwheel_select(self, current: List[BoxInput]) -> Optional[Tuple[int, _Placement]]:
+        """버퍼(current)에서 핀휠 규칙에 맞는 박스를 찾아 (index, placement)를
+        반환한다. 모든 변이 막히면 핀휠을 영구 종료하고 None을 반환한다."""
+        for _ in range(4):
+            edge = self._pinwheel_ptr
+
+            if self._pinwheel_closed[edge]:
+                self._pinwheel_ptr = (edge + 1) % 4
+                continue
+
+            best: Optional[_Placement] = None
+            best_index: Optional[int] = None
+            best_score = None
+
+            for idx, box in enumerate(current):
+                for dims, rotation in self._candidate_orientations(box["size"]):
+                    dx, dy, dz = dims
+
+                    if dz > self.pallet.height + _EPS:
+                        continue
+
+                    cand = self._pinwheel_edge_candidate(edge, dx, dy)
+                    if cand is None:
+                        continue
+
+                    x, y, consumed = cand
+                    z, support_ratio = self._query(x, y, dx, dy)
+
+                    # z<=0 == 기존 적재 박스와 겹치지 않음 (지지율도 자동 1.0)
+                    if z > _EPS or support_ratio < _SUPPORT_THRESHOLD - _EPS:
+                        continue
+
+                    score = (-dx * dy, -consumed)  # 큰 박스 우선, 그 다음 변 소비량 큰 것 우선
+
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_index = idx
+                        best = _Placement(
+                            score=(z, round(y, 4), round(x, 4)),
+                            x=x, y=y, z=z, dims=dims, rotation=rotation,
+                        )
+
+            if best is None:
+                self._pinwheel_closed[edge] = True
+                self._pinwheel_ptr = (edge + 1) % 4
+                continue
+
+            assert best_index is not None
+            dx, dy, _ = best.dims
+            _, _, consumed = self._pinwheel_edge_candidate(edge, dx, dy)  # type: ignore[misc]
+
+            if edge in (0, 1):
+                self._pinwheel_cursor[edge] += consumed
+            else:
+                self._pinwheel_cursor[edge] -= consumed
+
+            self._pinwheel_ptr = (edge + 1) % 4
+            return best_index, best
+
+        self._pinwheel_active = False
+        return None
+
+    # -----------------------------------------------------------------------
     # 적재 적용
     # -----------------------------------------------------------------------
 
@@ -269,15 +372,22 @@ class Palletizer:
             best_index: Optional[int] = None
             best_placement: Optional[_Placement] = None
 
-            for idx, box in enumerate(current):
-                placement = self._best_placement_for_box(box)
+            if self._pinwheel_active:
+                pinwheel_result = self._pinwheel_select(current)
 
-                if placement is None:
-                    continue
+                if pinwheel_result is not None:
+                    best_index, best_placement = pinwheel_result
 
-                if best_placement is None or placement.score < best_placement.score:
-                    best_placement = placement
-                    best_index = idx
+            if best_placement is None:
+                for idx, box in enumerate(current):
+                    placement = self._best_placement_for_box(box)
+
+                    if placement is None:
+                        continue
+
+                    if best_placement is None or placement.score < best_placement.score:
+                        best_placement = placement
+                        best_index = idx
 
             if best_placement is None or best_index is None:
                 self.finished = True
